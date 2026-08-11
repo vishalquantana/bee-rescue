@@ -1,0 +1,14 @@
+# Compiled Swift binaries (rebuilt by bee.sh)
+bee_tool
+bee_battery
+bee_connect
+ble_connect
+ble_scan
+*.dSYM/
+
+# Local runtime artifacts
+battery_log.txt
+
+# Editor / OS cruft
+.DS_Store
+.claude/
