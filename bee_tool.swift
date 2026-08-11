@@ -151,12 +151,41 @@ final class BeeTool: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         p.writeValue(Data(cmd), for: c, type: .withResponse)
     }
 
+    // Parse a Bee control notification the way BasedHardware/omi does:
+    //   raw = [respCode_lo, respCode_hi, ...payload]
+    //   if respCode == 0x8000 (echo): payload = [cmd_lo, cmd_hi, ...actualPayload]
+    // Returns (commandID, payload) or nil if too short.
+    static func parseControl(_ d: [UInt8]) -> (cmd: UInt16, payload: [UInt8])? {
+        guard d.count >= 2 else { return nil }
+        let code = UInt16(d[0]) | (UInt16(d[1]) << 8)
+        let rest = d.count > 2 ? Array(d.dropFirst(2)) : []
+        if code == 0x8000 && rest.count >= 2 {
+            let echoed = UInt16(rest[0]) | (UInt16(rest[1]) << 8)
+            return (echoed, rest.count > 2 ? Array(rest.dropFirst(2)) : [])
+        }
+        return (code, rest)
+    }
+
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
         guard let d = ch.value else { return }
-        if ch.uuid == BEE_CONTROL, d.count >= 2 {
-            let level = d[0], charging = d[1] != 0
-            let stamp = Self.hhmmss()
-            print("[\(stamp)] battery=\(level)%  charging=\(charging)")
+        if ch.uuid == BEE_CONTROL {
+            let bytes = Array(d)
+            let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            guard let (cmd, payload) = Self.parseControl(bytes) else { return }
+
+            // Only a battery (0xC00F) response carries [level, charging].
+            guard cmd == CMD_BATTERY else {
+                if case .connect = mode {
+                    print("[control] raw=\(hex)  cmd=0x\(String(format:"%04X",cmd)) payload=\(payload.map{String(format:"%02X",$0)}.joined(separator:" "))")
+                }
+                return
+            }
+            guard payload.count >= 2 else {
+                print("[\(Self.hhmmss())] battery response too short  raw=\(hex)")
+                return
+            }
+            let level = payload[0], charging = payload[1] != 0
+            print("[\(Self.hhmmss())] battery=\(level)%  charging=\(charging)   raw=\(hex)")
             switch mode {
             case .battery:
                 finish(0)

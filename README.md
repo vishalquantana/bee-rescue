@@ -48,10 +48,16 @@ Example output:
 
 ```
 Bluetooth on — scanning for 'Bee'...
-Found 'Bee' rssi=-63dBm — connecting...
+Found 'Bee' rssi=-52dBm — connecting...
 Connected ✓  discovering services...
-[04:21:17] battery=0%  charging=true
+[04:36:27] battery=35%  charging=true   raw=00 80 0F C0 23 01
 ```
+
+The `raw=` bytes are the decoded control frame. A Bee battery reply is
+`00 80 0F C0 <level> <charging>`: `00 80` = echo marker (`0x8000`), `0F C0` =
+the battery command (`0xC00F`) echoed back, then the **level** byte (`0x23` = 35)
+and the **charging** flag. The level lives in the *payload*, after the 4-byte
+header — read `raw[0]` by mistake and every reading looks like `0%`.
 
 Other modes:
 
@@ -132,7 +138,14 @@ device connection code:
 | Bee service | `03D5D5C4-A86C-11EE-9D89-8F2089A49E7E` |
 | Control characteristic (write + notify) | `05E1F93C-D8D0-5ED8-DD88-379E4C1A3E3E` |
 | Audio characteristic (notify, AAC/ADTS) | `B189A505-A86C-11EE-A5FB-8F2089A49E7E` |
-| Battery command (write to control char) | `0xC00F` → responds `[level, isCharging]` |
+| Battery command (write to control char) | `0xC00F` |
+
+**Decoding a control response.** A notification is `[respCode_lo, respCode_hi,
+…payload]`. If `respCode == 0x8000` it's an *echo* frame and the payload itself
+starts with the echoed command: `[cmd_lo, cmd_hi, …actualPayload]`. So a battery
+reply `00 80 0F C0 23 01` decodes to command `0xC00F`, payload `[0x23, 0x01]` →
+**level 35 %, charging**. Read the raw header bytes as the level and you'll wrongly
+report `0%`.
 
 The Bee advertises a **short 16-bit** service UUID (`D5C4`), so this tool scans all devices and
 matches on the name `Bee` rather than filtering on the full 128-bit UUID.
