@@ -10,6 +10,7 @@ import Foundation
 //   bee_tool battery     # connect, print battery %, exit  (default)
 //   bee_tool connect     # connect, dump all services/chars, stream 60s
 //   bee_tool monitor <n> # print battery every <n> seconds forever
+//   bee_tool audio [n]   # connect, unmute mic, count audio frames for n s (10)
 //
 // UUIDs sourced from github.com/BasedHardware/omi (Bee device connection).
 // ============================================================================
@@ -18,16 +19,20 @@ let BEE_SERVICE = CBUUID(string: "03D5D5C4-A86C-11EE-9D89-8F2089A49E7E")
 let BEE_CONTROL = CBUUID(string: "05e1f93c-d8d0-5ed8-dd88-379e4c1a3e3e")
 let BEE_AUDIO   = CBUUID(string: "b189a505-a86c-11ee-a5fb-8f2089a49e7e")
 let CMD_BATTERY: UInt16 = 0xC00F
+let CMD_UNMUTE:  UInt16 = 0xC006   // payload [0x01] starts the mic; [0x00] mutes
 
-enum Mode { case scan, battery, connect, monitor(Int) }
+enum Mode { case scan, battery, connect, monitor(Int), audio(Int) }
 
 final class BeeTool: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     let mode: Mode
     var central: CBCentralManager!
     var peripheral: CBPeripheral?
     var controlChar: CBCharacteristic?
+    var audioChar: CBCharacteristic?
     var seen = Set<UUID>()
     var finished = false
+    var audioFrames = 0
+    var audioBytes = 0
 
     init(mode: Mode) {
         self.mode = mode
@@ -123,6 +128,10 @@ final class BeeTool: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor svc: CBService, error: Error?) {
+        var streamAudio = false
+        if case .connect = mode { streamAudio = true }
+        if case .audio = mode { streamAudio = true }
+
         for ch in svc.characteristics ?? [] {
             if case .connect = mode {
                 var props = [String]()
@@ -135,19 +144,43 @@ final class BeeTool: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             if ch.uuid == BEE_CONTROL {
                 controlChar = ch
                 p.setNotifyValue(true, for: ch)
-            } else if ch.uuid == BEE_AUDIO, case .connect = mode {
-                p.setNotifyValue(true, for: ch)
+            } else if ch.uuid == BEE_AUDIO {
+                audioChar = ch
+                if streamAudio { p.setNotifyValue(true, for: ch) }
             }
         }
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
-        guard ch.uuid == BEE_CONTROL, let c = controlChar else { return }
-        requestBattery(p, c)
+        if let e = error { print("[subscribe err] \(ch.uuid): \(e.localizedDescription)"); return }
+        if ch.uuid == BEE_AUDIO {
+            print("[audio] audio-characteristic notify active = \(ch.isNotifying)")
+        }
+        if ch.uuid == BEE_CONTROL, let c = controlChar {
+            if case .audio = mode {
+                // Subscribe to audio first, wait ~1.2s (firmware settle), then unmute.
+                if let a = audioChar { p.setNotifyValue(true, for: a) }
+                print("[audio] subscribed; waiting 1.2s then sending unmute (0xC006 01)…")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self, let p = self.peripheral, let c = self.controlChar else { return }
+                    self.sendCommand(p, c, CMD_UNMUTE, payload: [0x01])
+                }
+            } else {
+                requestBattery(p, c)
+            }
+        }
+    }
+
+    func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
+        if let e = error { print("[write err] \(ch.uuid): \(e.localizedDescription)") }
     }
 
     func requestBattery(_ p: CBPeripheral, _ c: CBCharacteristic) {
-        let cmd: [UInt8] = [UInt8(CMD_BATTERY & 0xFF), UInt8((CMD_BATTERY >> 8) & 0xFF)]
+        sendCommand(p, c, CMD_BATTERY, payload: [])
+    }
+
+    func sendCommand(_ p: CBPeripheral, _ c: CBCharacteristic, _ id: UInt16, payload: [UInt8]) {
+        let cmd: [UInt8] = [UInt8(id & 0xFF), UInt8((id >> 8) & 0xFF)] + payload
         p.writeValue(Data(cmd), for: c, type: .withResponse)
     }
 
@@ -173,6 +206,12 @@ final class BeeTool: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
             guard let (cmd, payload) = Self.parseControl(bytes) else { return }
 
+            // Surface the unmute/mute ack in audio mode.
+            if cmd == CMD_UNMUTE, case .audio = mode {
+                print("[audio] unmute ACK  raw=\(hex)  payload=\(payload.map{String(format:"%02X",$0)}.joined(separator:" ")) — mic should stream now")
+                return
+            }
+
             // Only a battery (0xC00F) response carries [level, charging].
             guard cmd == CMD_BATTERY else {
                 if case .connect = mode {
@@ -196,8 +235,15 @@ final class BeeTool: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 }
             default: break
             }
-        } else if ch.uuid == BEE_AUDIO, case .connect = mode {
-            print("[audio] \(d.count) bytes (AAC/ADTS)")
+        } else if ch.uuid == BEE_AUDIO {
+            audioFrames += 1
+            audioBytes += d.count
+            if case .connect = mode {
+                print("[audio] \(d.count) bytes (AAC/ADTS)")
+            } else if case .audio = mode, audioFrames <= 3 {
+                let hex = d.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+                print("[audio] frame \(audioFrames): \(d.count) bytes  head=\(hex)…")
+            }
         }
     }
 
@@ -217,8 +263,9 @@ case "scan":    mode = .scan
 case "connect": mode = .connect
 case "monitor": mode = .monitor(args.count > 2 ? (Int(args[2]) ?? 180) : 180)
 case "battery": mode = .battery
+case "audio":   mode = .audio(args.count > 2 ? (Int(args[2]) ?? 10) : 10)
 default:
-    print("Usage: bee_tool [scan|battery|connect|monitor <seconds>]")
+    print("Usage: bee_tool [scan|battery|connect|monitor <seconds>|audio <seconds>]")
     exit(2)
 }
 
@@ -230,4 +277,11 @@ case .scan:    RunLoop.main.run(until: Date(timeIntervalSinceNow: 20)); print("\
 case .connect: RunLoop.main.run(until: Date(timeIntervalSinceNow: 60)); print("\nDone.")
 case .battery: RunLoop.main.run(until: Date(timeIntervalSinceNow: 25)); print("Timed out — Bee not found / not advertising."); exit(1)
 case .monitor: RunLoop.main.run()   // forever
+case .audio(let secs):
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: Double(secs) + 8))
+    if tool.audioFrames > 0 {
+        print("\n✅ AUDIO OK — received \(tool.audioFrames) frames / \(tool.audioBytes) bytes. Mic is streaming.")
+    } else {
+        print("\n❌ NO AUDIO — connected but zero audio frames after unmute. (mic off / not granted / firmware)")
+    }
 }
